@@ -1,0 +1,6 @@
+1)Keep insert timestamp with each record-Done
+(Remove on get if expired-Done)
+2)Do encryption and decryption-done basic
+3)Do election when leader dies
+4)Dynamic only one file if follower inject those handlers and if leader inject respective handlers
+5)Store role as per server config
