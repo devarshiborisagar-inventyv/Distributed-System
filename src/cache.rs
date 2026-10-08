@@ -28,10 +28,15 @@ impl Data {
 pub type Store = Arc<Mutex<HashMap<String, Data>>>;
 
 #[derive(Serialize, Deserialize, Clone)]
-
-pub struct SetKeyReq {
-    pub security_key:String
+pub struct InitReqLeader {
+    pub secrete: String,
+    pub follwers_list: Vec<String>,
 }
+#[derive(Serialize, Deserialize, Clone)]
+pub struct InitReqFollower {
+    pub secrete: String,
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SetReq {
@@ -65,10 +70,35 @@ pub struct KeyRes {
     pub key: String,
     pub value: Option<Data>,
 }
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Role {
+    Leader,
+    Follower,
+    Orchestrator,
+}
 
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Node{
+    pub ip: String,
+    pub port: u16,
+    pub role: Role,
+    pub node_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct InitReqBody{
+    pub replication_count: u16,
+}
 /// Active expiry: drop expired keys every 10s. Lazy expiry on GET still
 /// matters — this only bounds how long dead entries hold memory.
-pub async fn start_passive_cleaner(role: String, store: Store) {
+pub async fn start_passive_cleaner(role: Role, store: Store) {
     loop {
         sleep(Duration::from_secs(10)).await;
         let mut map = store.lock().unwrap();

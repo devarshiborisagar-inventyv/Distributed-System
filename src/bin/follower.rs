@@ -2,12 +2,13 @@ use axum::{
     Router,
     routing::{get, post},
 };
-use mini_db::cache::start_passive_cleaner;
-use mini_db::handlers::handlers::{AppState, delete_data, get_data, hello, set_data};
+use mini_db::cache::{Role, start_passive_cleaner};
+use mini_db::handlers::handlers::{AppState, delete_data, get_data, hello, set_data, init_node};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use std::sync::RwLock;
 
 #[tokio::main]
 async fn main() {
@@ -16,13 +17,14 @@ async fn main() {
         data: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    tokio::spawn(start_passive_cleaner("follower".to_string(), state.data.clone()));
+    tokio::spawn(start_passive_cleaner(Role::Follower, state.data.clone()));
 
     let app = Router::new()
         .route("/", get(hello))
         .route("/set", post(set_data))
         .route("/get", post(get_data))
         .route("/delete", post(delete_data))
+        .route("/init_data", post(init_node))
         .with_state(state);
 
     let port = std::env::args().nth(1).unwrap_or_else(|| "3001".to_string());

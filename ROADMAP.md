@@ -95,25 +95,100 @@ afterward; one follower killed and writes still return in <300ms.
 
 ---
 
-## Phase 7 — One binary, role at runtime
+## Phase 7 — Orchestrator: spawn, then push config
 
-Raft nodes change role while running. A design where "leader" and "follower"
-are two different modules chosen at compile time cannot express *"follower 3002
-becomes leader at 3am"*. This is `TodaysPlan` items 4 and 5, and it is a
-prerequisite for election, not a tidy-up.
+**Decision taken:** the orchestrator starts the nodes and pushes their config
+in afterwards. `POST /init {replication_count}` → generate keys → spawn leader
++ N followers → wait for them → push config to each.
 
-- [ ] Collapse `handlers/handlers.rs` and `handlers/leader_handlers.rs` into
-      one handler set. There is one `AppState`, one `set_data`, one `get_data`.
-- [ ] Role becomes runtime state: `enum Role { Follower, Candidate, Leader }`
-      inside the state, not a module choice.
-- [ ] Handlers branch on role. A write to a non-leader responds "not leader,
-      leader is X" (307 redirect or a JSON hint) rather than accepting it.
-- [ ] Config from a TOML file + `clap`: node id, listen address, peer list.
-      Delete the hardcoded `followers_list` in `main.rs:16`.
-- [ ] `run.sh` starts N copies of the *same* binary with different configs.
-- [ ] Delete `bin/follower.rs` and the empty `src/orchestrator.rs`.
+Known expiry date: Raft's persisted state (term, votedFor, peer set) must be
+durable and node-local, so from Phase 9 the peer list stops being pushable and
+becomes node-owned. The key distribution below survives; the peer list doesn't.
+Build it knowing that.
 
-**Checkpoint:** one binary, four configs, cluster behaves exactly as before.
+### 7a — Make the shape compile
+
+Current WIP doesn't build. These are structural, not typos-only:
+
+- [ ] `bin/orchestrator.rs` is a copy of `main.rs`: empty `AppState {}` but
+      still calls `state.data.clone()` and imports `leader_handlers`. The
+      orchestrator has no cache — drop `start_passive_cleaner` and the
+      `/set` `/get` `/delete` routes from it entirely.
+- [ ] **Port collision:** orchestrator binds 3000 and so does the leader
+      (`main.rs:31`); `orchestrator_handlers.rs:23` also assigns the leader
+      3000. Give the orchestrator its own port (4000), leader 3000, followers
+      3001+.
+- [ ] `orchestrator_handlers.rs:39` — `leader_nodeder` typo, and `&mut Node`
+      is passed where the signature takes `&Vec<Node>`.
+- [ ] `InitReqBody` has no `Deserialize` but is used as `Json<InitReqBody>`.
+- [ ] Rename the orchestrator's `set_data` → `init_cluster`, route `/set` →
+      `/init`. It is not a KV write and the name will mislead you later.
+- [ ] `start_setup_leader_follower` must be `async` — it spawns, polls and
+      pushes.
+
+### 7b — Key distribution (get this right or nothing else matters)
+
+- [ ] `generateKeys() -> Vec<String>` is positional: `[0]` is the **private**
+      signing key, `[1]` the public one. One index slip ships the signing key
+      to every follower, and any follower can then forge leader writes. Return
+      a named struct (`ClusterKeys { signing, verifying }`) so the mistake is
+      unrepresentable.
+- [ ] Leader receives `signing` only. Followers receive `verifying` only.
+      Never one payload type for both roles.
+- [ ] Rename to `generate_keys` (Rust is snake_case; `generateKeys` warns).
+
+### 7c — Authenticate the push
+
+`/set_key` currently accepts a key from anyone who can reach the port, with no
+auth. Overwrite the verifying key with your own and you can forge writes to
+every follower — the whole signing scheme, undone by one unauthenticated POST.
+This is a trust boundary; it does not get a "later".
+
+- [ ] Orchestrator generates a random bootstrap token per cluster and passes it
+      to each child as a spawn arg or env var. (Yes — one piece of config still
+      arrives at spawn. That's the bootstrap root; everything else can push.)
+- [ ] `/configure` requires that token in a header; constant-time compare.
+- [ ] Bind node listeners to `127.0.0.1` until there's real transport auth.
+- [ ] Reject `/configure` once configured, unless the token matches **and** the
+      epoch is higher — otherwise it's a permanent key-rotation backdoor.
+
+### 7d — The unconfigured window
+
+Nodes boot with `verifying_key: ""` and routes already live. A write landing in
+that window panics: `string_to_signing_key("")` fails the 32-byte check and
+gets unwrapped. The window is small, and it will still find you.
+
+- [ ] Hold config as `Option<NodeConfig>` in state. `None` → every data route
+      returns 503.
+- [ ] `/health` = process alive (always 200). `/ready` = configured (503 until
+      the push lands). The orchestrator needs both and they are not the same
+      question.
+- [ ] Push order: **followers first, leader last.** Configure the leader first
+      and it can accept a write and fan out to followers that have no key yet.
+
+### 7e — Spawning
+
+- [ ] `tokio::process::Command` + `std::env::current_exe()` to locate sibling
+      binaries, `.kill_on_drop(true)`.
+- [ ] **Keep the `Child` handles in orchestrator state.** With `kill_on_drop`,
+      dropping a handle kills that process immediately — a spawn helper that
+      returns `()` kills the cluster it just started.
+- [ ] Pipe child stdout/stderr and prefix each line with the node id. Four
+      nodes interleaved in one terminal is unreadable, and you are about to
+      debug elections.
+- [ ] Readiness = poll `/health` with a deadline. Never `sleep()`.
+- [ ] Idempotent config with an `epoch: u64`, so a retried or late push can't
+      clobber newer config.
+- [ ] All-or-nothing: if a push fails after others succeeded, retry to a
+      deadline, then kill every child and fail the `/init` call. A
+      half-configured cluster is worse than none.
+- [ ] Watch for child exit and re-push on respawn — config is in memory only,
+      so a crashed node comes back silently unconfigured.
+- [ ] `/cluster` on the orchestrator: node list, pid, role, ready state.
+
+**Checkpoint:** `POST /init {"replication_count": 3}` returns only once all
+four nodes are up, configured and `/ready`; a write then succeeds end to end;
+Ctrl-C on the orchestrator leaves no orphan processes.
 
 ---
 
