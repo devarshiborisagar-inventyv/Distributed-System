@@ -6,7 +6,11 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use crate::error::lock;
 use tokio::time::{Duration, sleep};
+
+
+
 
 /// A cached value. `experied_in` is the TTL in **seconds**; 0 = never expires.
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -101,7 +105,7 @@ pub struct InitReqBody{
 pub async fn start_passive_cleaner(role: Role, store: Store) {
     loop {
         sleep(Duration::from_secs(10)).await;
-        let mut map = store.lock().unwrap();
+        let mut map = lock(&store);
         let before = map.len();
         map.retain(|_, d| !d.is_expired());
         if before != map.len() {

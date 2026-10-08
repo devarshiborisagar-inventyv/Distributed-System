@@ -12,6 +12,8 @@ use std::{collections::HashMap, sync::{Arc, Mutex, RwLock}};
 
 #[tokio::main]
 async fn main() {
+    const ADDR: &str = "0.0.0.0:3000";
+
     let state = AppState {
         signing_key: Arc::new(RwLock::new(String::new())),
         data: Arc::new(Mutex::new(HashMap::new())),
@@ -28,9 +30,18 @@ async fn main() {
         .route("/init_data", post(init_node))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
-        .await
-        .unwrap();
+    let listener = match tokio::net::TcpListener::bind(ADDR).await {
+        Ok(l) => l,
+        Err(e) => {
+            // A bind clash is the usual cause and the panic hid it. Say so.
+            eprintln!("[leader] cannot bind {}: {e}", ADDR);
+            std::process::exit(1);
+        }
+    };
 
-    axum::serve(listener, app).await.unwrap();
+    println!("leader listening on {ADDR}");
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("[leader] server stopped: {e}");
+        std::process::exit(1);
+    }
 }

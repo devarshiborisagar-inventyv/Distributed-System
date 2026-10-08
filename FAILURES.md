@@ -15,31 +15,42 @@ Status: ⬜ open · 🔍 tracing · ✅ fixed + test
 
 ## A. The node stops existing
 
-### ⬜ A1 — One read of a key that was never written, and the node is gone
-```
-POST localhost:3001/get {"key":"never-written"}
-```
-Connection drops. Every subsequent request to that node also drops — including
-reads for keys you know are there, and writes from the leader. `ps` shows the
-process is still alive. Only a restart brings it back.
+> **All of section A closed on 2026-10-08** by the error-type pass: every
+> request path returns `Result<_, AppError>`, and locks recover from poisoning
+> instead of propagating it. Each entry below keeps its original symptom text
+> so you can still re-run it and see the new status code.
 
-### ⬜ A2 — The load generator kills the cluster in under a second
+### ✅ A1 — One read of a key that was never written, and the node is gone
+**Fixed on both roles (2026-10-08).** Verified: a miss returns 200 "Key not
+found" and the node keeps serving.
+```
+POST localhost:3000/get {"key":"never-written"}
+```
+Connection drops. Every subsequent *data* request to that node also drops —
+reads for keys you know are there, and writes too.
+
+Now look closer, because this is the part worth keeping: `GET /` on that same
+node still answers **200**. The process is alive and its health check is green.
+Anything that decides "is this node up?" by hitting `/` will say yes, forever,
+about a node that cannot serve a single request. Followers are untouched.
+
+### ✅ A2 — The load generator kills the cluster in under a second
 Start a clean cluster, run `stress.rs`. Within the first moments the leader
 stops answering. Errors reported by the tool climb to 100%. The leader process
 is still running.
 
-### ⬜ A3 — A write that arrives a moment too early takes the leader down
+### ✅ A3 — A write that arrives a moment too early takes the leader down
 Start the cluster through the orchestrator. Send a write to the leader in the
 window between "the port is open" and "the orchestrator reports success".
 The leader dies. Do it a second later and everything is fine.
 
-### ⬜ A4 — A single malformed write kills a follower permanently
+### ✅ A4 — A single malformed write kills a follower permanently
 ```
 POST localhost:3001/set {"encrypted_payload":"garbage"}
 ```
 That follower is finished. Note who can reach that port.
 
-### ⬜ A5 — Asking for too many replicas takes the orchestrator down
+### ✅ A5 — Asking for too many replicas takes the orchestrator down
 ```
 POST localhost:4000/init {"replication_count": 65000}
 ```
@@ -111,10 +122,11 @@ thinks its third node is.
 Four processes keep running and keep holding their ports. Nothing supervises
 them. Now try to start a fresh orchestrator and call `/init` again.
 
-### ⬜ E2 — A failed `/init` leaves processes behind, then blocks the retry
+### ⬜ E2 — A failed `/init` leaves processes behind, and the retry makes it worse
 Make `/init` fail partway — take one port before calling it, so one node can
-never become ready. Read the error. Then look at what is running, and try
-`/init` again.
+never become ready. Read the error. Then look at what is still running. Now
+call `/init` again and read *that* result carefully: compare what it claims it
+started against what `ps` says is actually serving each port.
 
 ### ⬜ E3 — `/init` succeeds against a cluster that isn't the one it started
 Leave the processes from E1 running. Start a new orchestrator, call `/init`.

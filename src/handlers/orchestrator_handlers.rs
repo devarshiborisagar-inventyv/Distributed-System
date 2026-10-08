@@ -1,6 +1,6 @@
-use axum::http::StatusCode;
 use axum::{Json, extract::State};
 use crate::cache::{InitReqBody, Node, Role};
+use crate::error::{AppError, lock};
 use crate::handlers::generate_keys::generate_keys;
 use futures::future::try_join_all;
 use serde_json::json;
@@ -35,19 +35,13 @@ pub async fn hello() -> &'static str {
     "Hello"
 }
 
-type ApiError = (StatusCode, String);
-
-fn bad(msg: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, msg.to_string())
-}
-
 /// Spawn a cluster, wait for every node to answer, then push its config in.
 pub async fn init_cluster(
     state: State<AppState>,
     req: Json<InitReqBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.nodes.lock().unwrap().is_empty() {
-        return Err((StatusCode::CONFLICT, "cluster already started".into()));
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !lock(&state.nodes).is_empty() {
+        return Err(AppError::ClusterAlreadyStarted);
     }
 
     let keys = generate_keys();
@@ -59,28 +53,29 @@ pub async fn init_cluster(
         role: Role::Leader,
     };
 
+    // `3000 + i` overflows u16 well before it runs out of ports; checked_add
+    // turns a silly request into a 400 instead of a dead orchestrator.
     let follower_nodes: Vec<Node> = (1..=req.replication_count)
-        .map(|i| Node {
-            ip: "localhost".to_string(),
-            node_id: Uuid::new_v4().to_string(),
-            port: 3000 + i,
-            role: Role::Follower,
+        .map(|i| {
+            Ok(Node {
+                ip: "localhost".to_string(),
+                node_id: Uuid::new_v4().to_string(),
+                port: 3000u16
+                    .checked_add(i)
+                    .ok_or(AppError::TooManyReplicas(u32::from(req.replication_count)))?,
+                role: Role::Follower,
+            })
         })
-        .collect();
+        .collect::<Result<_, AppError>>()?;
 
-    let children = start_setup_leader_follower(&leader_node, &follower_nodes)
-        .await
-        .map_err(bad)?;
-    state.children.lock().unwrap().extend(children);
+    let children = start_setup_leader_follower(&leader_node, &follower_nodes).await?;
+    lock(&state.children).extend(children);
 
     // A spawned process is not a listening process. Push config before the
     // node binds its port and every request is a connection refused.
     for node in std::iter::once(&leader_node).chain(follower_nodes.iter()) {
         if !wait_ready(&state.client, node, Duration::from_secs(5)).await {
-            return Err(bad(format!(
-                "{}:{} never became ready",
-                node.role, node.port
-            )));
+            return Err(AppError::NodeNotReady(format!("{}:{}", node.role, node.port)));
         }
     }
 
@@ -116,11 +111,11 @@ pub async fn init_cluster(
 
     // reqwest calls a 404 `Ok`, so error_for_status is what actually catches a
     // missing /init_data route.
-    for res in try_join_all(pushes).await.map_err(bad)? {
-        res.error_for_status().map_err(bad)?;
+    for res in try_join_all(pushes).await? {
+        res.error_for_status()?;
     }
 
-    let mut nodes = state.nodes.lock().unwrap();
+    let mut nodes = lock(&state.nodes);
     nodes.push(leader_node);
     nodes.extend(follower_nodes);
 
@@ -150,18 +145,18 @@ async fn wait_ready(client: &reqwest::Client, node: &Node, timeout: Duration) ->
 }
 
 /// Spawn the leader and every follower as child processes. Returns their
-/// handles — the caller MUST keep them alive (see `NODES`).
+/// handles — the caller MUST keep them alive (`kill_on_drop`).
 ///
 /// Binaries are resolved next to the running orchestrator, so this works from
 /// any cwd and picks up debug/release automatically.
 pub async fn start_setup_leader_follower(
     leader_node: &Node,
     follower_nodes: &[Node],
-) -> std::io::Result<Vec<Child>> {
-    let dir = std::env::current_exe()?
-        .parent()
-        .expect("exe has no parent dir")
-        .to_path_buf();
+) -> Result<Vec<Child>, AppError> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| {
+        std::io::Error::other("running binary has no parent directory")
+    })?;
     let bin = |name: &str| dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
 
     let mut children = Vec::with_capacity(follower_nodes.len() + 1);

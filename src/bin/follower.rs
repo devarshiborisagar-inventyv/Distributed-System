@@ -28,10 +28,18 @@ async fn main() {
         .with_state(state);
 
     let port = std::env::args().nth(1).unwrap_or_else(|| "3001".to_string());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .unwrap();
+    let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
+        Ok(l) => l,
+        Err(e) => {
+            // A bind clash is the usual cause and the panic hid it. Say so.
+            eprintln!("[follower] cannot bind :{port}: {e}");
+            std::process::exit(1);
+        }
+    };
 
     println!("follower listening on :{port}");
-    axum::serve(listener, app).await.unwrap();
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("[follower] server stopped: {e}");
+        std::process::exit(1);
+    }
 }
