@@ -60,7 +60,7 @@ The orchestrator dies. The cluster it had already started does not.
 
 ## B. The data quietly disagrees
 
-### ⬜ B1 — A follower is down for an hour and every write still returns 200
+### ✅ B1 — A follower is down for an hour and every write still returns 200
 Kill one follower. Keep writing to the leader. Every write succeeds. The
 orchestrator still lists four healthy nodes. Nothing in any log mentions the
 dead node. Reads against it are wrong for as long as it stays down.
@@ -77,6 +77,19 @@ POST localhost:3002/delete {"key":"hello"}
 No signature, no token. The leader still has the key. Reads now depend on which
 node answers. The leader will never re-send it.
 
+### ⬜ B5 — A write is acknowledged while one follower silently never gets it
+Freeze one follower, write a key, unfreeze it, then read that key from each
+follower:
+```
+3001: Key not found      <- acknowledged write, never arrived
+3002: Data is Found
+3003: Data is Found
+```
+The client was told 200. Nothing retries, nothing logs a permanent gap, and
+that follower serves a miss for that key forever. Introduced deliberately on
+2026-10-09 by returning as soon as a majority acks — the right trade, but only
+once something exists to catch the straggler up.
+
 ### ⬜ B4 — A follower restarts and silently stops accepting replication
 Kill one follower, start it again by hand on the same port. The leader keeps
 sending it writes and keeps returning 200 to clients. That node never receives
@@ -86,15 +99,17 @@ another value, and nothing reports it.
 
 ## C. Everything hangs
 
-### ⬜ C1 — One frozen follower stops all writes, cluster-wide
+### ✅ C1 — One frozen follower stops all writes, cluster-wide
 Freeze a follower rather than killing it — `kill -STOP` on its pid, so TCP
 still accepts but nothing ever replies. Now write to the leader. The request
 never returns. Neither does any other write. The leader is healthy, idle, and
 completely stuck. `kill -CONT` and everything unblocks at once.
 
-### ⬜ C2 — Reads stall behind a stuck write
-While C1 is in progress, try to read from the leader. Note what happens, and
-whether it depends on which key you ask for.
+### ✅ C2 — Reads stall behind a stuck write
+**Answered: they don't.** This was the pair that looks related to C1 and isn't.
+The store lock is released before the fan-out is awaited, so reads were never
+blocked by a stuck write. Worth knowing *why* before you change the locking in
+Phase 10 — it is easy to reintroduce by holding a guard across an `.await`.
 
 ---
 
@@ -145,7 +160,7 @@ cluster looks like. Ask the leader. Compare with `ps`.
 Run the load generator against a machine with spare CPU. Watch p99 climb with
 concurrency while the CPU stays largely idle.
 
-### ⬜ F2 — Every write pays a new TCP handshake per follower
+### ✅ F2 — Every write pays a new TCP handshake per follower
 Watch sockets on the leader during a sustained write load — `ss -s`, or count
 `TIME_WAIT`. Compare the count to the number of writes. Then compare write
 latency to the round-trip time of a single follower call.

@@ -3,14 +3,84 @@ use crate::error::{AppError, lock, read, write};
 use crate::handlers::encrypt::{sign_data, string_to_signing_key};
 use axum::{Json, extract::State};
 use chrono::Utc;
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
+use serde::Serialize;
 use std::sync::{Arc, RwLock};
+use tokio::time::{Duration, sleep};
 
+/// How long the leader will wait for followers before answering the client.
+const FANOUT_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Replicate one operation to every follower and return how many accepted it.
+///
+/// Returns as soon as a majority of the *cluster* has it (the leader is
+/// already one member, so it needs `followers/2` more), or when the deadline
+/// passes — whichever comes first. One frozen follower therefore costs the
+/// deadline, not the request.
+///
+/// Every caller that mutates state must go through here. Giving `/set` its own
+/// copy is how `/delete` ended up with no timeout, no shared client and no
+/// error reporting.
+async fn replicate<B: Serialize>(
+    http_client: &reqwest::Client,
+    followers: &[String],
+    path: &str,
+    body: &B,
+) -> usize {
+    if followers.is_empty() {
+        return 0;
+    }
+
+    let mut sends: FuturesUnordered<_> = followers
+        .iter()
+        .map(|follower| {
+            http_client
+                .post(format!("http://{follower}{path}"))
+                .json(body)
+                .send()
+        })
+        .collect();
+
+    // Majority of (leader + followers), with the leader counted as an ack.
+    let needed = (followers.len() + 1) / 2;
+    let mut accepted = 0usize;
+
+    let deadline = sleep(FANOUT_DEADLINE);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            Some(result) = sends.next() => {
+                match result {
+                    // reqwest calls a 4xx/5xx reply `Ok`, so the status has to
+                    // be checked explicitly or a rejection counts as an ack.
+                    Ok(r) if r.status().is_success() => accepted += 1,
+                    Ok(r) => eprintln!("[leader] follower rejected {path}: HTTP {}", r.status()),
+                    Err(e) => eprintln!("[leader] follower failed {path}: {e}"),
+                }
+                if accepted >= needed || sends.is_empty() {
+                    break;
+                }
+            }
+            _ = &mut deadline => {
+                eprintln!(
+                    "[leader] {path} deadline hit: {accepted}/{} followers acked, needed {needed}",
+                    followers.len()
+                );
+                break;
+            }
+        }
+    }
+
+    accepted
+}
 #[derive(Clone)]
 pub struct AppState {
     pub signing_key: Arc<RwLock<String>>,
     pub data: Store,
     pub followers_list: Arc<RwLock<Vec<String>>>,
+    pub active_follower_list:Vec<String>,
+    pub http_client:reqwest::Client
 }
 
 pub async fn hello() -> &'static str {
@@ -30,6 +100,9 @@ pub async fn set_data(
     state: State<AppState>,
     data: Json<SetReq>,
 ) -> Result<&'static str, AppError> {
+
+    let http_client = state.http_client.clone();
+
     let data_to_insert = Data {
         value: data.value.clone(),
         created_at: Utc::now(),
@@ -55,15 +128,9 @@ pub async fn set_data(
 
     lock(&state.data).insert(data.key.clone(), data_to_insert.clone());
 
-    //Loop over followersList and send req to all to update
     let followers = read(&state.followers_list).clone();
-    let sends = followers.iter().map(|follower| {
-        reqwest::Client::new()
-            .post(format!("http://{}/set", follower))
-            .json(&data_to_send_to_followers)
-            .send() // a Future that BORROWS follower & data
-    });
-    join_all(sends).await;
+    replicate(&http_client, &followers, "/set", &data_to_send_to_followers).await;
+
     println!(
         "Data is set key:{} value:{:?} in leader node",
         &data.key, &data.value
@@ -109,13 +176,7 @@ pub async fn delete_data(state: State<AppState>, data: Json<KeyReq>) -> Json<Key
 
     // fan the delete out too, otherwise followers keep the stale value forever
     let followers = read(&state.followers_list).clone();
-    let sends = followers.iter().map(|follower| {
-        reqwest::Client::new()
-            .post(format!("http://{}/delete", follower))
-            .json(&data.0)
-            .send()
-    });
-    join_all(sends).await;
+    replicate(&state.http_client, &followers, "/delete", &data.0).await;
 
     Json(match removed {
         Some(value) => KeyRes {

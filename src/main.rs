@@ -7,6 +7,7 @@ use mini_db::handlers::leader_handlers::{
     delete_data,
     init_node,
 };
+use std::time::Duration;
 use axum::{Router, routing::{get, post}};
 use std::{collections::HashMap, sync::{Arc, Mutex, RwLock}};
 
@@ -17,7 +18,12 @@ async fn main() {
     let state = AppState {
         signing_key: Arc::new(RwLock::new(String::new())),
         data: Arc::new(Mutex::new(HashMap::new())),
-        followers_list: Arc::new(RwLock::new(vec![]))
+        followers_list: Arc::new(RwLock::new(vec![])),
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("could not build http client"),
+        active_follower_list:vec![]
     };
 
     tokio::spawn(start_passive_cleaner(Role::Leader, state.data.clone()));
